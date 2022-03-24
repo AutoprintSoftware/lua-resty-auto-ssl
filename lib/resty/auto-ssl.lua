@@ -53,6 +53,10 @@ function _M.new(options)
     options["renew_check_interval"] = 86400 -- 1 day
   end
 
+  if not options["renewals_per_hour"] then
+    options["renewals_per_hour"] = 30
+  end
+
   if not options["hook_server_port"] then
     options["hook_server_port"] = 8999
   end
@@ -102,6 +106,61 @@ end
 function _M.has_certificate(self, domain, shmem_only)
   local has_certificate = require "resty.auto-ssl.utils.has_certificate"
   return has_certificate(self, domain, shmem_only)
+end
+
+function _M.get_failures(self, domain)
+  local storage_adapter = self.storage.adapter
+  local string = storage_adapter:get(domain .. ":failures")
+
+  if data then
+    local failures, json_err = self.storage.json_adapter:decode(string)
+
+    if json_err then
+      ngx.log(ngx.ERR, json_err, domain)
+    end
+
+    if failures then
+      local mt = {
+        __concat = function(op_1, op_2)
+          return tostring(op_1) .. tostring(op_2)
+        end,
+	__tostring = function(f)
+          return "first: " .. f["first"] .. ", last: " .. f["last"] .. ", num: " .. f["num"]
+        end
+      }
+
+      setmetatable(failures, mt)
+    end
+  end
+end
+
+function _M.track_failure(self, domain)
+  local storage_adapter = self.storage.adapter
+  local json = storage_adapter:get(domain .. ":failures")
+  local failures
+
+  if json then
+    failures = self.storage.json_adapter:decode(json)
+  end
+
+  if not failures then
+    failures = {}
+    failures["first"] = ngx.now()
+    failures["last"] = failures["first"]
+    failures["num"] = 1
+  else
+    failures["last"] = ngx.now()
+    failures["num"] = failures["num"] + 1
+  end
+
+  json = self.storage.json_adapter:encode(failures)
+  storage_adapter:set(domain .. ":failures", failures, {
+    exptime = 2592000,
+  })
+end
+
+function _M.track_success(self, domain)
+  self.storage.adapter:delete(domain .. ":failures")
 end
 
 function _M.hook_server(self)

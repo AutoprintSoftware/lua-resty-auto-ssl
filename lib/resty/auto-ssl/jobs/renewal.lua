@@ -5,6 +5,8 @@ local shuffle_table = require "resty.auto-ssl.utils.shuffle_table"
 local ssl_provider = require "resty.auto-ssl.ssl_providers.lets_encrypt"
 
 local _M = {}
+local min_renewal_seconds
+local last_renewal
 
 -- Based on lua-rest-upstream-healthcheck's lock:
 -- https://github.com/openresty/lua-resty-upstream-healthcheck/blob/v0.03/lib/resty/upstream/healthcheck.lua#L423-L440
@@ -56,6 +58,8 @@ local function delete_cert_if_expired(domain, storage, cert)
 end
 
 local function renew_check_cert(auto_ssl_instance, storage, domain)
+  ngx.log(ngx.ERR, "auto-ssl: running renewal for domain: ", domain)
+
   -- Before issuing a cert, create a local lock to ensure multiple workers
   -- don't simultaneously try to register the same cert.
   local local_lock, new_local_lock_err = lock:new("auto_ssl", { exptime = 30, timeout = 30 })
@@ -140,6 +144,14 @@ local function renew_check_cert(auto_ssl_instance, storage, domain)
       ngx.log(ngx.NOTICE, "auto-ssl: expiry date is more than 30 days out, skipping renewal: ", domain)
       renew_check_cert_unlock(domain, storage, local_lock, distributed_lock_value)
       return
+    elseif now + (15 * 24 * 60 * 60) < cert["expiry"] then
+      local rand_value = math.random(cert["expiry"] - (30 * 24 * 60 * 60), cert["expiry"] - (15 * 24 * 60 * 60))
+      local rand_renewal_threshold = now
+
+      if rand_value < rand_renewal_threshold then
+        ngx.log(ngx.ERR, "auto-ssl: expiry date is more than 15 days out, randomly not picked for renewal: ", domain)
+        renew_check_cert_unlock(domain, storage, local_lock, distributed_lock_value)
+      end
     end
   end
 
@@ -185,7 +197,26 @@ local function renew_check_cert(auto_ssl_instance, storage, domain)
   local _, issue_err = ssl_provider.issue_cert(auto_ssl_instance, domain)
   if issue_err then
     ngx.log(ngx.ERR, "auto-ssl: issuing renewal certificate failed: ", issue_err)
+
+    -- Give up on renewing this certificate if we didn't manage to renew
+    -- it before the expiration date
     delete_cert_if_expired(domain, storage, cert)
+    auto_ssl_instance:track_failure(domain)
+  else
+    auto_ssl_instance:track_success(domain)
+  end
+
+  -- Throttle renewal requests based on renewals_per_hour setting
+  if last_renewal and ngx.now() - last_renewal < min_renewal_seconds then
+    local to_sleep = min_renewal_seconds - (ngx.now() - last_renewal)
+    ngx.log(ngx.ERR, "auto-ssl: pausing renewal job for " .. to_sleep .. " seconds")
+    ngx.sleep(to_sleep)
+  end
+
+  if last_renewal then
+    last_renewal = last_renewal + min_renewal_seconds
+  else
+    last_renewal = ngx.now()
   end
 
   renew_check_cert_unlock(domain, storage, local_lock, distributed_lock_value)
@@ -204,9 +235,17 @@ local function renew_all_domains(auto_ssl_instance)
     -- renewal attempts).
     shuffle_table(domains)
 
+    min_renewal_seconds = 3600 / auto_ssl_instance:get("renewals_per_hour")
+    last_renewal = ngx.now()
+
+    ngx.log(ngx.ERR, "auto-ssl: starting renewal")
+    local renewal_start = ngx.now()
+
     for _, domain in ipairs(domains) do
       renew_check_cert(auto_ssl_instance, storage, domain)
     end
+
+    ngx.log(ngx.ERR, "auto-ssl: finishing renewal (took " .. (ngx.now() - renewal_start) .. " seconds")
   end
 end
 
@@ -241,12 +280,17 @@ end
 local function renew(premature, auto_ssl_instance)
   if premature then return end
 
+  local start = ngx.now()
   local renew_ok, renew_err = pcall(do_renew, auto_ssl_instance)
   if not renew_ok then
     ngx.log(ngx.ERR, "auto-ssl: failed to run do_renew cycle: ", renew_err)
   end
 
-  local timer_ok, timer_err = ngx.timer.at(auto_ssl_instance:get("renew_check_interval"), renew, auto_ssl_instance)
+  local delay = math.max(0, auto_ssl_instance:get("renew_check_interval") - (ngx.now() - start))
+
+  ngx.log(ngx.ERR, "auto-ssl: scheduling next renewal check " .. delay .. " seconds from now")
+
+  local timer_ok, timer_err = ngx.timer.at(delay, renew, auto_ssl_instance)
   if not timer_ok then
     if timer_err ~= "process exiting" then
       ngx.log(ngx.ERR, "auto-ssl: failed to create timer: ", timer_err)
@@ -255,8 +299,10 @@ local function renew(premature, auto_ssl_instance)
   end
 end
 
-function _M.spawn(auto_ssl_instance)
-  local ok, err = ngx.timer.at(auto_ssl_instance:get("renew_check_interval"), renew, auto_ssl_instance)
+function _M.spawn(auto_ssl_instance, timer_rand)
+  local delay = timer_rand * auto_ssl_instance:get("renew_check_interval")
+  ngx.log(ngx.ERR, "auto-ssl: scheduling first renewal check " .. delay .. " seconds from now")
+  local ok, err = ngx.timer.at(delay, renew, auto_ssl_instance)
   if not ok then
     ngx.log(ngx.ERR, "auto-ssl: failed to create timer: ", err)
     return
