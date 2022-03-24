@@ -331,6 +331,7 @@ function _M.set_cert(self, domain, fullchain_pem, privkey_pem, cert_pem, expiry)
     return nil, err
   end
 
+ -- If we can not find domain_hub_id we store cert in redis. its the only thing we can do
   if table_size(res) < 1 then
     return self.adapter:set(domain .. ":latest", string)
   end
